@@ -43,6 +43,8 @@ jobs:
 
   docker:
     name: Docker image (multi-arch)
+    # Only build/publish an image once lint, typecheck, tests and build pass.
+    needs: check
     runs-on: ubuntu-latest
     # Least privilege: write to GHCR only; PRs never push.
     permissions:
