@@ -1,516 +1,297 @@
 <template>
   <div class="page">
-    <div class="header">
-      <img class="logo" src="/logo.png" alt="ImmichSwipe" draggable="false" />
-      <div class="spacer" />
-      <button class="refresh" @click="showNextCard" :disabled="initialLoading">↻</button>
-    </div>
+    <AppTopBar :summary="summary" @scope="scopeOpen = true" @help="helpOpen = true" @settings="settingsOpen = true" />
+    <StatsBar :stats="queue.stats.value" />
 
-    <div class="card-area">
-      <div v-if="error && !currentId" class="state error">
-        <p>{{ error }}</p>
-        <button @click="retryInitial">Try again</button>
+    <main class="card-area">
+      <div v-if="showSkeleton" class="skeleton" aria-busy="true" aria-label="Loading photos" />
+
+      <div v-else-if="queue.loadError.value && !current" class="state" role="alert">
+        <h2>Could not load photos</h2>
+        <p>{{ queue.loadError.value }}</p>
+        <button type="button" class="btn primary" @click="queue.retry()">Retry</button>
       </div>
 
-      <div v-else-if="!currentId && initialLoading" class="state loading">Loading...</div>
+      <div v-else-if="queue.exhausted.value" class="state">
+        <h2>All done for this scope</h2>
+        <p>
+          {{ queue.stats.value.reviewed }} reviewed:
+          {{ queue.stats.value.kept }} kept, {{ queue.stats.value.favourited }} favourited,
+          {{ queue.stats.value.trashed }} trashed.
+          <template v-if="queue.skipped.value.size">
+            {{ queue.skipped.value.size }} skipped this session.
+          </template>
+        </p>
+        <button type="button" class="btn primary" @click="scopeOpen = true">Change scope</button>
+      </div>
 
-      <SwipeCard ref="swipe" v-else class="card" :style="cardAspectStyle" @like="onLikeCommit" @dislike="onDislikeCommit" @superlike="onSuperlikeCommit" @options="onOptions" @cancel="onCancel">
-        <img :src="imageUrl" :key="currentId" alt="Random from Immich" class="photo" draggable="false" @load="onImgLoad" />
-        <div class="meta" v-if="formattedTakenAt || locationWithFlag">
-          <div class="line time" v-if="formattedTakenAt">{{ formattedTakenAt }}</div>
-          <div class="line location" v-if="locationWithFlag">{{ locationWithFlag }}</div>
-        </div>
+      <SwipeCard
+        v-else-if="current"
+        ref="card"
+        class="card"
+        :style="{ '--ratio': ratio }"
+        :item-key="current.id"
+        :disabled="queue.pending.value || anyOverlayOpen"
+        @swipe="onSwipe"
+        @details="detailsOpen = true"
+      >
+        <PhotoView :item="current" @size="onSize" />
       </SwipeCard>
+    </main>
 
-      <div v-if="showOptions" class="modal-backdrop" @click.self="closeOptions">
-        <div class="modal">
-          <h3>Image options</h3>
-          <p class="id">ID: <code>{{ currentId }}</code></p>
-          <div class="actions">
-            <a v-if="immichAssetUrl" class="btn" :href="immichAssetUrl" target="_blank" rel="noopener" @click.stop>Open in Immich</a>
-            <button class="btn danger" :disabled="deleting" @click="deleteCurrent">{{ deleting ? 'Deleting…' : 'Delete image' }}</button>
-            <button class="btn" :disabled="deleting" @click="closeOptions">Close</button>
-          </div>
-          <p v-if="deleteError" class="error">{{ deleteError }}</p>
-        </div>
-      </div>
-    </div>
+    <ActionBar
+      :disabled="queue.pending.value || queue.loading.value"
+      :has-item="!!current"
+      @undo="undo"
+      @trash="act('trash')"
+      @skip="skip"
+      @favourite="act('favourite')"
+      @keep="act('keep')"
+    />
 
+    <DetailsSheet
+      :open="detailsOpen"
+      :item="current"
+      :immich-web-url="immichWebUrl"
+      :disabled="queue.pending.value"
+      @close="detailsOpen = false"
+      @skip="skipFromDetails"
+    />
+    <ScopePicker :open="scopeOpen" :scope="queue.scope.value" :save="queue.setScope" @close="scopeOpen = false" />
+    <SettingsSheet
+      :open="settingsOpen"
+      :scope-summary="summary"
+      :reset="queue.resetHistory"
+      @close="settingsOpen = false"
+      @change-scope="openScopeFromSettings"
+      @shortcuts="openHelpFromSettings"
+    />
+    <ShortcutsOverlay :open="helpOpen" @close="helpOpen = false" />
   </div>
 </template>
 
 <script setup lang="ts">
+import { computed, onBeforeUnmount, onMounted, ref, useTemplateRef, watch } from 'vue'
+import ActionBar from '~/components/ActionBar.vue'
+import AppTopBar from '~/components/AppTopBar.vue'
+import DetailsSheet from '~/components/DetailsSheet.vue'
+import PhotoView from '~/components/PhotoView.vue'
+import ScopePicker from '~/components/ScopePicker.vue'
+import SettingsSheet from '~/components/SettingsSheet.vue'
+import ShortcutsOverlay from '~/components/ShortcutsOverlay.vue'
+import StatsBar from '~/components/StatsBar.vue'
 import SwipeCard from '~/components/SwipeCard.vue'
-import { ref, computed, onMounted } from 'vue'
+import type { Decision } from '~/types/api'
+import { scopeSummary } from '~/utils/format'
+import { isTypingTarget, keyToAction } from '~/utils/keyboard'
 
-// Exposed methods from SwipeCard
-type SwipeCardExposed = { flingRight: () => Promise<void>; flingLeft: () => Promise<void>; flingUp: () => Promise<void> }
-const swipe = ref<SwipeCardExposed | null>(null)
+const toast = useToast()
+const queue = useReviewQueue({ api: useApi(), onError: toast.error, onInfo: toast.info })
+const { load: loadAlbums, nameOf } = useAlbums()
+const immichWebUrl = useRuntimeConfig().public.immichWebUrl
 
-const currentId = ref<string | null>(null)
-const error = ref<string | null>(null)
+const card = useTemplateRef('card')
+const current = queue.current
 
-// Options modal state
-const showOptions = ref(false)
-const deleting = ref(false)
-const deleteError = ref<string | null>(null)
+const detailsOpen = ref(false)
+const scopeOpen = ref(false)
+const settingsOpen = ref(false)
+const helpOpen = ref(false)
+const anyOverlayOpen = computed(() => detailsOpen.value || scopeOpen.value || settingsOpen.value || helpOpen.value)
 
-// Metadata for display
-const takenAt = ref<string | null>(null)
-const location = ref<{
-  text: string | null
-  city: string | null
-  state: string | null
-  country: string | null
-  latitude: number | null
-  longitude: number | null
-} | null>(null)
+/** False until the first load has finished (avoids flashing an empty state). */
+const started = ref(false)
+const showSkeleton = computed(() =>
+  !current.value && !queue.loadError.value && !queue.exhausted.value && (queue.loading.value || queue.refilling.value || !started.value),
+)
 
-const formattedTakenAt = computed(() => {
-  if (!takenAt.value) return ''
-  const d = new Date(takenAt.value)
-  if (isNaN(d.getTime())) return ''
-  try {
-    return new Intl.DateTimeFormat(undefined, {
-      year: 'numeric', month: 'short', day: '2-digit',
-      hour: '2-digit', minute: '2-digit'
-    } as Intl.DateTimeFormatOptions).format(d)
-  } catch {
-    return d.toLocaleString()
-  }
+const summary = computed(() => scopeSummary(queue.scope.value, nameOf(queue.scope.value.albumId)))
+
+// Card aspect ratio: real image size once loaded, else Immich's dimensions, else 3:4.
+const natural = ref<{ id: string, ratio: number } | null>(null)
+const ratio = computed(() => {
+  const item = current.value
+  if (!item) return 0.75
+  if (natural.value?.id === item.id) return natural.value.ratio
+  if (item.width && item.height) return item.width / item.height
+  return 0.75
 })
-
-const locationText = computed(() => {
-  const loc = location.value
-  if (!loc) return ''
-  if (loc.text) return loc.text
-  const parts = [loc.city, loc.state, loc.country].filter(Boolean)
-  return parts.join(', ')
-})
-
-function toFlagEmojiFromCountry(countryRaw?: string | null): string {
-  if (!countryRaw) return ''
-  const map: Record<string, string> = {
-    'UNITED STATES': 'US', 'USA': 'US', 'US': 'US', 'U.S.A.': 'US',
-    'UNITED KINGDOM': 'GB', 'UK': 'GB', 'ENGLAND': 'GB', 'SCOTLAND': 'GB', 'WALES': 'GB', 'GB': 'GB',
-    'GERMANY': 'DE', 'DEUTSCHLAND': 'DE', 'DE': 'DE',
-    'FRANCE': 'FR', 'FR': 'FR',
-    'SPAIN': 'ES', 'ESPAÑA': 'ES', 'ES': 'ES',
-    'ITALY': 'IT', 'ITALIA': 'IT', 'IT': 'IT',
-    'AUSTRIA': 'AT', 'ÖSTERREICH': 'AT', 'AT': 'AT',
-    'SWITZERLAND': 'CH', 'SCHWEIZ': 'CH', 'SUISSE': 'CH', 'SVIZZERA': 'CH', 'CH': 'CH',
-    'PORTUGAL': 'PT', 'PT': 'PT',
-    'NETHERLANDS': 'NL', 'HOLLAND': 'NL', 'NL': 'NL',
-    'POLAND': 'PL', 'POLSKA': 'PL', 'PL': 'PL',
-    'CZECHIA': 'CZ', 'CZECH REPUBLIC': 'CZ', 'CZ': 'CZ',
-    'BELGIUM': 'BE', 'BE': 'BE',
-    'SWEDEN': 'SE', 'SE': 'SE',
-    'NORWAY': 'NO', 'NO': 'NO',
-    'DENMARK': 'DK', 'DK': 'DK',
-    'FINLAND': 'FI', 'FI': 'FI',
-    'IRELAND': 'IE', 'IE': 'IE',
-    'CANADA': 'CA', 'CA': 'CA',
-    'AUSTRALIA': 'AU', 'AU': 'AU',
-    'NEW ZEALAND': 'NZ', 'NZ': 'NZ',
-    'JAPAN': 'JP', 'JP': 'JP',
-    'CHINA': 'CN', 'CN': 'CN',
-    'INDIA': 'IN', 'IN': 'IN'
-  }
-  const key = countryRaw.trim().toUpperCase()
-  let code = map[key]
-  if (!code) {
-    // If already looks like a 2-letter alpha code
-    if (/^[A-Z]{2}$/.test(key)) code = key
-  }
-  if (!code) return ''
-  return isoToFlagEmoji(code)
+function onSize(width: number, height: number) {
+  if (current.value) natural.value = { id: current.value.id, ratio: width / height }
 }
 
-function isoToFlagEmoji(code: string): string {
-  if (!/^[A-Z]{2}$/.test(code)) return ''
-  const base = 0x1F1E6
-  const chars = code.split('').map(c => String.fromCodePoint(base + (c.charCodeAt(0) - 65)))
-  return chars.join('')
-}
+const EXIT_DIR = { trash: 'left', keep: 'right', favourite: 'up' } as const
+const SWIPE_DECISION = { left: 'trash', right: 'keep', up: 'favourite' } as const
 
-const locationWithFlag = computed(() => {
-  const text = locationText.value
-  const flag = toFlagEmojiFromCountry(location.value?.country || null)
-  if (flag && text) return `${flag} ${text}`
-  if (text) return text
-  return ''
-})
-
-const natural = ref<{ w: number; h: number } | null>(null)
-const cardAspectStyle = computed(() => {
-  const n = natural.value
-  if (n && n.w > 0 && n.h > 0) {
-    return { aspectRatio: `${n.w} / ${n.h}` }
+/** Sends a decision; the card leaves only once the server has confirmed it. */
+async function act(decision: Decision, fromSwipe = false) {
+  if (!fromSwipe) {
+    if (queue.pending.value || !current.value) return
+    card.value?.nudge(EXIT_DIR[decision])
   }
-  // Fallback until the image loads
-  return { aspectRatio: '3 / 4' }
-})
-
-const imageUrl = computed(() => (currentId.value ? `/api/image?id=${encodeURIComponent(currentId.value)}` : ''))
-
-// Immich deep link for opening the current asset in Immich Web
-const runtime = useRuntimeConfig()
-const immichAssetUrl = computed(() => {
-  const base = (runtime as any)?.public?.immichUrl as string | undefined
-  const id = currentId.value
-  if (!base || !id) return ''
-  const clean = base.endsWith('/') ? base.slice(0, -1) : base
-  return `${clean}/photos/${encodeURIComponent(id)}`
-})
-
-// Two-card pipeline: keep next card preloaded for instant swap
-const initialLoading = ref(true)
-const preloading = ref(false)
-const nextCard = ref<{
-  id: string
-  takenAt: string | null
-  location: {
-    text: string | null
-    city: string | null
-    state: string | null
-    country: string | null
-    latitude: number | null
-    longitude: number | null
-  } | null
-  natural: { w: number; h: number } | null
-} | null>(null)
-
-async function fetchRandomMeta() {
-  return await $fetch<{
-    id: string
-    localDateTime?: string | null
-    takenAt?: string | null
-    location?: {
-      text: string | null
-      city: string | null
-      state: string | null
-      country: string | null
-      latitude: number | null
-      longitude: number | null
-    } | null
-  }>(`/api/random`)
+  const outcome = await queue.decide(decision, () => card.value?.exit(EXIT_DIR[decision]))
+  if (outcome === 'failed' || outcome === 'ignored') void card.value?.springBack()
 }
 
-function preloadImage(url: string): Promise<{ w: number; h: number }> {
-  return new Promise((resolve, reject) => {
-    const img = new Image()
-    img.onload = () => resolve({ w: img.naturalWidth || img.width, h: img.naturalHeight || img.height })
-    img.onerror = (e) => reject(e)
-    // Try to decode for smoother paint if supported
-    // @ts-ignore
-    if (img.decode) {
-      img.addEventListener('load', async () => {
-        try { /* no-op, already loaded */ } catch {}
-      })
-    }
-    img.src = url
-  })
+function onSwipe(dir: 'left' | 'right' | 'up') {
+  void act(SWIPE_DECISION[dir], true)
 }
 
-async function preloadNext() {
-  if (preloading.value) return
-  preloading.value = true
-  try {
-    const res = await fetchRandomMeta()
-    const url = `/api/image?id=${encodeURIComponent(res.id)}`
-    let dims: { w: number; h: number } | null = null
-    try {
-      dims = await preloadImage(url)
-    } catch {
-      // If image decode fails, still proceed; aspect will adjust on load
-      dims = null
-    }
-    nextCard.value = {
-      id: res.id,
-      takenAt: res.takenAt || res.localDateTime || null,
-      location: res.location || null,
-      natural: dims,
-    }
-    error.value = null
-  } catch (e: any) {
-    if (!currentId.value) {
-      error.value = e?.message || 'Failed to load random image'
-    }
-    nextCard.value = null
-  } finally {
-    preloading.value = false
-  }
+async function skip() {
+  await queue.skip(() => card.value?.exit('down'))
 }
 
-function applyNextToCurrent() {
-  if (!nextCard.value) return false
-  const n = nextCard.value
-  currentId.value = n.id
-  takenAt.value = n.takenAt
-  location.value = n.location
-  natural.value = n.natural
-  nextCard.value = null
+function skipFromDetails() {
+  detailsOpen.value = false
+  void skip()
+}
+
+function undo() {
+  void queue.undo()
+}
+
+function openScopeFromSettings() {
+  settingsOpen.value = false
+  scopeOpen.value = true
+}
+function openHelpFromSettings() {
+  settingsOpen.value = false
+  helpOpen.value = true
+}
+
+function closeTopOverlay() {
+  if (helpOpen.value) helpOpen.value = false
+  else if (scopeOpen.value) scopeOpen.value = false
+  else if (settingsOpen.value) settingsOpen.value = false
+  else if (detailsOpen.value) detailsOpen.value = false
+  else return false
   return true
 }
 
-async function showNextCard() {
-  // If we already have a preloaded next card, swap immediately
-  let swapped = applyNextToCurrent()
-  if (!swapped) {
-    await preloadNext()
-    swapped = applyNextToCurrent()
+function onKeydown(e: KeyboardEvent) {
+  if (isTypingTarget(e.target)) {
+    // Escape still closes a panel from inside its inputs.
+    if (e.key === 'Escape' && closeTopOverlay()) e.preventDefault()
+    return
   }
-  // Start preloading the following card immediately
-  void preloadNext()
-}
-
-function retryInitial() {
-  initialLoading.value = true
-  currentId.value = null
-  takenAt.value = null
-  location.value = null
-  natural.value = null
-  error.value = null
-  void initPipeline()
-}
-
-function onImgLoad(e: Event) {
-  const img = e.target as HTMLImageElement
-  if (img && img.naturalWidth && img.naturalHeight) {
-    natural.value = { w: img.naturalWidth, h: img.naturalHeight }
+  const action = keyToAction(e)
+  if (!action) return
+  if (action === 'close') {
+    if (closeTopOverlay()) e.preventDefault()
+    return
   }
-}
-
-async function commit(action: 'like' | 'dislike' | 'superlike') {
-  const prevId = currentId.value
-  // Swap immediately for snappy UX
-  showNextCard()
-  if (prevId) {
-    try {
-      await $fetch(`/api/${action}`, { method: 'POST', body: { id: prevId } })
-    } catch (e) {
-      console.error(e)
-    }
+  if (action === 'help') {
+    e.preventDefault()
+    helpOpen.value = !helpOpen.value
+    return
   }
-}
-
-// Called by SwipeCard after its fling completes
-function onLikeCommit() {
-  void commit('like')
-}
-function onDislikeCommit() {
-  void commit('dislike')
-}
-function onSuperlikeCommit() {
-  void commit('superlike')
-}
-
-// Trigger programmatic fling animations from buttons
-async function triggerLike() {
-  if (!swipe.value) return
-  await swipe.value.flingRight()
-}
-async function triggerDislike() {
-  if (!swipe.value) return
-  await swipe.value.flingLeft()
-}
-async function triggerSuperlike() {
-  // No dedicated up-swipe animation; commit immediately
-  await commit('superlike')
-}
-
-function onOptions() {
-  deleteError.value = null
-  showOptions.value = true
-}
-function closeOptions() {
-  if (deleting.value) return
-  showOptions.value = false
-}
-async function deleteCurrent() {
-  if (!currentId.value) return
-  deleting.value = true
-  deleteError.value = null
-  try {
-    await $fetch('/api/delete', { method: 'POST', body: { id: currentId.value } })
-    // After deletion, move to next card
-    showOptions.value = false
-    await showNextCard()
-  } catch (e: any) {
-    deleteError.value = e?.data?.message || e?.message || 'Failed to delete image'
-  } finally {
-    deleting.value = false
+  if (action === 'details' && detailsOpen.value) {
+    e.preventDefault()
+    detailsOpen.value = false
+    return
+  }
+  // Review actions only apply to the card, not while a panel is open.
+  if (anyOverlayOpen.value) return
+  e.preventDefault()
+  if (e.repeat) return
+  switch (action) {
+    case 'trash':
+    case 'keep':
+    case 'favourite':
+      void act(action)
+      break
+    case 'details':
+      if (current.value) detailsOpen.value = true
+      break
+    case 'skip':
+      void skip()
+      break
+    case 'undo':
+      undo()
+      break
   }
 }
 
-function onCancel() {
-  // no-op for now
-}
+// The details sheet has nothing to show once the queue runs dry.
+watch(current, (item) => {
+  if (!item) detailsOpen.value = false
+})
 
-async function initPipeline() {
-  try {
-    await preloadNext()
-    applyNextToCurrent()
-    // Kick off preloading of the following card
-    void preloadNext()
-  } finally {
-    initialLoading.value = false
-  }
-}
+watch(() => queue.scope.value.albumId, (id) => {
+  if (id) void loadAlbums()
+})
 
-onMounted(() => {
-  void initPipeline()
+onMounted(async () => {
+  window.addEventListener('keydown', onKeydown)
+  await queue.init()
+  started.value = true
+})
+
+onBeforeUnmount(() => {
+  window.removeEventListener('keydown', onKeydown)
 })
 </script>
 
 <style scoped>
 .page {
-  height: 100dvh; /* lock viewport height */
-  overflow: hidden; /* prevent page scroll */
+  height: 100vh;
+  height: 100dvh;
+  max-width: 960px;
+  margin: 0 auto;
   display: grid;
-  grid-template-rows: 90px 1fr; /* fixed header height; controls removed */
+  grid-template-rows: auto auto minmax(0, 1fr) auto;
+  overflow: hidden;
+  padding: env(safe-area-inset-top) env(safe-area-inset-right) env(safe-area-inset-bottom) env(safe-area-inset-left);
 }
-.header {
-  display: flex;
-  align-items: center;
-  gap: 12px;
-  padding: 0 16px; /* internal spacing so it doesn't affect layout height */
-}
-.header .logo {
-  height: 70px; /* adjusted per request */
-  max-height: 100%;
-  width: auto;
-  display: block;
-}
-.header .spacer {
-  flex: 1;
-}
-.header .refresh {
-  font-size: 20px;
-  border: none;
-  background: transparent;
-  cursor: pointer;
-}
-
 .card-area {
   position: relative;
   display: grid;
   place-items: center;
-  width: 100%;
-  height: 100%;
-  overflow: hidden; /* ensure content stays within */
-  padding: 8px 16px; /* breathing room without causing page scroll */
-  box-sizing: border-box;
+  min-height: 0;
+  padding: 6px 14px;
+  container-type: size;
+  overflow: hidden;
 }
 .card {
-  /* Use container width to avoid overflow with parent padding */
-  width: min(100%, 1100px);
-  max-width: 100%;
-  max-height: 100%;
-  background: #111;
+  --ratio: 0.75;
+  width: min(100cqw, 100cqh * var(--ratio));
+  aspect-ratio: var(--ratio);
+  max-height: 100cqh;
+  background: var(--card-bg);
   border-radius: 16px;
   overflow: hidden;
-  box-shadow: 0 10px 30px rgba(0,0,0,0.35);
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.35);
 }
-.photo {
-  width: 100%;
-  height: 100%;
-  object-fit: contain; /* preserve original aspect ratio */
-  user-select: none;
+.skeleton {
+  width: min(100cqw, 100cqh * 0.75);
+  aspect-ratio: 3 / 4;
+  border-radius: 16px;
+  background: linear-gradient(100deg, var(--surface-2) 40%, var(--surface) 50%, var(--surface-2) 60%);
+  background-size: 200% 100%;
+  animation: shimmer 1.4s linear infinite;
 }
-
-/* Metadata overlay inside the card */
-.meta {
-  position: absolute;
-  left: 0;
-  right: 0;
-  bottom: 0;
-  padding: 12px 14px;
-  color: #fff;
-  font-size: 14px;
-  line-height: 1.35;
-  background: linear-gradient(180deg, rgba(0,0,0,0) 0%, rgba(0,0,0,0.45) 40%, rgba(0,0,0,0.7) 100%);
-  pointer-events: none; /* do not block swipe */
+@keyframes shimmer {
+  from { background-position: 100% 0; }
+  to { background-position: -100% 0; }
 }
-.meta .line { text-shadow: 0 1px 2px rgba(0,0,0,0.6); }
-.meta .time { font-weight: 700; }
-.meta .location { opacity: 0.95; }
-
-.controls {
-  display: flex;
-  justify-content: center;
-  align-items: center;
-  gap: 16px;
-  padding: 8px 16px; /* internal spacing */
-  box-sizing: border-box;
+@media (prefers-reduced-motion: reduce) {
+  .skeleton { animation: none; }
 }
-.btn {
-  padding: 12px 20px;
-  border-radius: 999px;
-  border: none;
-  font-weight: 700;
-  font-size: 16px;
-  cursor: pointer;
-}
-.btn.dislike { background: #fee2e2; color: #991b1b; }
-.btn.like { background: #d1fae5; color: #065f46; }
-.btn.superlike { background: #dbeafe; color: #1e3a8a; }
-
-.state.loading, .state.error {
-  color: #777;
-  font-size: 14px;
-}
-.state.error button { margin-top: 8px; }
-
-/* Options modal */
-.modal-backdrop {
-  position: fixed;
-  inset: 0;
-  background: rgba(0,0,0,0.55);
+.state {
   display: grid;
-  place-items: center;
-  z-index: 50;
+  justify-items: center;
+  gap: 10px;
+  max-width: 420px;
+  padding: 24px;
+  text-align: center;
 }
-.modal {
-  background: #1f2937; /* gray-800 */
-  color: #fff;
-  width: min(92vw, 520px);
-  border-radius: 12px;
-  padding: 16px;
-  box-shadow: 0 20px 60px rgba(0,0,0,0.4);
+.state h2 {
+  margin: 0;
+  font-size: 20px;
 }
-.modal h3 {
-  margin: 0 0 8px;
-}
-.modal .id {
-  word-break: break-all;
-  opacity: 0.9;
-}
-.modal .actions {
-  display: flex;
-  gap: 12px;
-  margin-top: 12px;
-}
-.btn.danger {
-  background: #fee2e2;
-  color: #991b1b;
-}
-.modal .error {
-  color: #fca5a5;
-  margin-top: 10px;
-}
-
-/* Landscape optimizations */
-@media (orientation: landscape) {
-  /* Keep fixed tracks; just tweak card sizing and control spacing */
-  .card {
-    /* Use container-relative sizing to avoid horizontal overflow with padding */
-    width: min(100%, 95vh);
-    max-width: 100%;
-    max-height: 100%;
-  }
-  .controls {
-    gap: 24px;
-  }
+.state p {
+  margin: 0;
+  color: var(--muted);
+  line-height: 1.45;
 }
 </style>

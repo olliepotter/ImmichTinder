@@ -1,22 +1,31 @@
 // https://nuxt.com/docs/api/configuration/nuxt-config
 export default defineNuxtConfig({
-  compatibilityDate: '2025-07-15',
-  devtools: { enabled: true },
-  runtimeConfig: {
-    public: {
-      // Expose Immich base URL to client for deep-linking
-      immichUrl: process.env.IMMICH_URL
-    }
-  },
+  modules: ['@nuxt/eslint'],
+
+  devtools: { enabled: process.env.NODE_ENV !== 'production' },
+
   app: {
     head: {
       title: 'Immich Tinder',
-      link: [
-        { rel: 'preconnect', href: 'https://fonts.googleapis.com' },
-        { rel: 'preconnect', href: 'https://fonts.gstatic.com', crossorigin: '' },
-        { rel: 'stylesheet', href: 'https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700;800&display=swap' },
-        { rel: 'icon', type: 'image/png', href: '/favicon.png' }
-      ]
-    }
-  }
+      link: [{ rel: 'icon', type: 'image/png', href: '/favicon.png' }],
+    },
+  },
+
+  // Every key can be overridden at runtime with NUXT_<KEY> env vars
+  // (e.g. NUXT_IMMICH_URL, NUXT_PUBLIC_IMMICH_WEB_URL). Legacy env names
+  // (IMMICH_URL, IMMICH_TOKEN, ...) are resolved at runtime by
+  // server/utils/config.ts. See docs/DESIGN.md.
+  runtimeConfig: {
+    immichUrl: '',
+    immichApiKey: '',
+    appPassword: '',
+    sessionPassword: '',
+    databasePath: './data/immich-tinder.db',
+    cookieSecure: process.env.NODE_ENV === 'production',
+    public: {
+      immichWebUrl: '',
+    },
+  },
+
+  compatibilityDate: '2025-07-15',
 })
