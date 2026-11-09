@@ -1,0 +1,83 @@
+# ImmichTinder: Dockge / Docker Compose stack (app only).
+#
+# Use this file when Tailscale runs on the TrueNAS host (the TrueNAS Tailscale
+# app) and you expose the app with `tailscale serve` there. For a self-contained
+# stack with its own Tailscale sidecar, use docker-compose.tailscale.yml
+# instead (paste that one into Dockge). See docs/deployment.md.
+#
+# Variables in ${...} are read from the `.env` file next to this file (Dockge
+# edits it in the stack's ".env" pane). Required: IMMICH_NETWORK, DATA_PATH,
+# plus the app settings in .env.example.
+#
+# Nothing is published on 0.0.0.0. The app is never meant to be public.
+
+name: immich-tinder
+
+services:
+  immich-tinder:
+    # Option A (default): prebuilt multi-arch image from GHCR.
+    image: ghcr.io/olliepotter/immichtinder:latest
+    # Option B: build from the GitHub repo instead. Comment out `image:` above
+    # (or keep it to tag the local build) and uncomment:
+    # build:
+    #   context: https://github.com/olliepotter/ImmichTinder.git#main
+    #   args:
+    #     APP_UID: "568"
+    #     APP_GID: "568"
+    container_name: immich-tinder
+    restart: unless-stopped
+    init: false # tini is already PID 1 inside the image
+    environment:
+      # Only the app's own variables are passed in (not the whole .env), so the
+      # Tailscale auth key and other stack variables never reach the app.
+      NUXT_IMMICH_URL: ${NUXT_IMMICH_URL:?set NUXT_IMMICH_URL in .env}
+      NUXT_IMMICH_API_KEY: ${NUXT_IMMICH_API_KEY:?set NUXT_IMMICH_API_KEY in .env}
+      NUXT_APP_PASSWORD: ${NUXT_APP_PASSWORD:?set NUXT_APP_PASSWORD in .env}
+      NUXT_SESSION_PASSWORD: ${NUXT_SESSION_PASSWORD:?set NUXT_SESSION_PASSWORD in .env}
+      NUXT_PUBLIC_IMMICH_WEB_URL: ${NUXT_PUBLIC_IMMICH_WEB_URL:-}
+      # Fixed inside the container.
+      NUXT_DATABASE_PATH: /data/immich-tinder.db
+      HOST: 0.0.0.0
+      PORT: "3000"
+    # Must match the owner of DATA_PATH on the host (TrueNAS "apps" = 568:568).
+    user: "${APP_UID:-568}:${APP_GID:-568}"
+    volumes:
+      # TrueNAS dataset, e.g. /mnt/fast/apps/immich-tinder/data
+      - ${DATA_PATH:?set DATA_PATH in .env}:/data
+    networks:
+      - immich
+    # Publish NO ports by default. For Tailscale on the TrueNAS host
+    # (`tailscale serve ... http://127.0.0.1:3000`), uncomment the loopback-only
+    # mapping below. Never use "3000:3000", which binds to 0.0.0.0.
+    # ports:
+    #   - "127.0.0.1:3000:3000"
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 256
+    mem_limit: 512m
+    memswap_limit: 512m
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - "fetch('http://127.0.0.1:3000/api/health',{signal:AbortSignal.timeout(4000)}).then(r=>process.exit(r.ok?0:1),()=>process.exit(1))"
+      interval: 30s
+      timeout: 5s
+      start_period: 20s
+      retries: 3
+
+networks:
+  immich:
+    # The existing network your Immich server is attached to. Find it with
+    #   docker network ls
+    #   docker inspect immich_server --format '{{json .NetworkSettings.Networks}}'
+    # Typical names: immich_default (Immich's own compose / Dockge stack "immich")
+    # or ix-immich_default (TrueNAS catalog app).
+    name: ${IMMICH_NETWORK:?set IMMICH_NETWORK in .env}
+    external: true

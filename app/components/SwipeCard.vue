@@ -2,230 +2,344 @@
   <div
     ref="card"
     class="swipe-card"
-    :class="{
-      animating: state.animating,
-      liking: state.animating && state.animDir === 'right',
-      disliking: state.animating && state.animDir === 'left',
-      superliking: state.animating && state.animDir === 'up',
-    }"
+    :class="[`phase-${phase}`, hint ? `hint-${hint}` : null]"
     :style="cardStyle"
+    role="group"
+    aria-roledescription="swipeable photo"
     @pointerdown="onPointerDown"
+    @pointermove="onPointerMove"
+    @pointerup="onPointerUp"
+    @pointercancel="onPointerCancel"
+    @lostpointercapture="onPointerCancel"
   >
     <slot />
-    <div class="badge like" :class="{ pop: showLike || (state.animating && state.animDir==='right') }" v-if="showLike || (state.animating && state.animDir==='right')">LIKE</div>
-    <div class="badge dislike" :class="{ pop: showDislike || (state.animating && state.animDir==='left') }" v-if="showDislike || (state.animating && state.animDir==='left')">NOPE</div>
-    <div class="badge superlike" :class="{ pop: showSuperlike || (state.animating && state.animDir==='up') }" v-if="showSuperlike || (state.animating && state.animDir==='up')">SUPERLIKE</div>
+    <div v-if="hint" class="tint" :class="`tint-${hint}`" :style="{ opacity: tintOpacity }" aria-hidden="true" />
+    <div v-if="hint" class="stamp" :class="`stamp-${hint}`" :style="{ opacity: stampOpacity }" aria-hidden="true">
+      {{ STAMP_LABELS[hint] }}
+    </div>
   </div>
 </template>
 
 <script setup lang="ts">
-import { computed, onUnmounted, reactive, ref } from 'vue'
+import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { leaningDir, resolveSwipe } from '~/utils/swipe'
+import type { SwipeDir } from '~/utils/swipe'
+
+const props = withDefaults(defineProps<{
+  /** Changes whenever a different photo is shown; resets the card. */
+  itemKey?: string | null
+  /** Ignore new drags (e.g. while a request is pending). */
+  disabled?: boolean
+}>(), { itemKey: null, disabled: false })
 
 const emit = defineEmits<{
-  (e: 'like'): void
-  (e: 'dislike'): void
-  (e: 'superlike'): void
-  (e: 'options'): void
-  (e: 'cancel'): void
+  /** Drag released past the threshold. The card holds until exit() or springBack(). */
+  swipe: [dir: 'left' | 'right' | 'up']
+  /** Drag released downwards: open the details sheet (card springs back). */
+  details: []
 }>()
 
+const STAMP_LABELS: Record<SwipeDir, string> = {
+  left: 'TRASH',
+  right: 'KEEP',
+  up: 'FAVOURITE',
+  down: 'DETAILS',
+}
+
+type Phase = 'idle' | 'dragging' | 'holding' | 'exiting' | 'returning' | 'entering'
+
+const EXIT_MS = 260
+const RETURN_MS = 380
+const MAX_ROTATION = 22
+
 const card = ref<HTMLElement | null>(null)
+const phase = ref<Phase>('idle')
+const dx = ref(0)
+const dy = ref(0)
+const opacity = ref(1)
+const scale = ref(1)
+/** Hint forced by nudge()/exit(), overriding the drag direction. */
+const forcedHint = ref<SwipeDir | null>(null)
+const reducedMotion = ref(false)
 
-const state = reactive({
-  dragging: false,
-  animating: false,
-  animDir: null as null | 'left' | 'right' | 'up',
-  startX: 0,
-  startY: 0,
-  dx: 0,
-  dy: 0,
+let pointerId: number | null = null
+let startX = 0
+let startY = 0
+let rotationSign = 1
+let samples: { x: number, y: number, t: number }[] = []
+let timer: ReturnType<typeof setTimeout> | null = null
+let motionQuery: MediaQueryList | null = null
+
+function threshold() {
+  const width = card.value?.getBoundingClientRect().width ?? 0
+  return Math.max(80, Math.min(140, width * 0.28))
+}
+
+const hint = computed(() => forcedHint.value ?? leaningDir(dx.value, dy.value))
+
+const progress = computed(() => {
+  if (forcedHint.value) return 1
+  const d = hint.value === 'left' || hint.value === 'right' ? Math.abs(dx.value) : Math.abs(dy.value)
+  return Math.min(1, d / threshold())
 })
-
-const ROTATE_FACTOR = 0.05 // rotation per px of dx
-const THRESHOLD_X = 100 // px horizontal to trigger
-const THRESHOLD_Y = 100 // px vertical to trigger
-
-const showLike = computed(() => state.dx > 40)
-const showDislike = computed(() => state.dx < -40)
-const showSuperlike = computed(() => state.dy < -60 && Math.abs(state.dy) > Math.abs(state.dx))
+const tintOpacity = computed(() => progress.value * 0.32)
+const stampOpacity = computed(() => Math.min(1, progress.value * 1.3))
 
 const cardStyle = computed(() => {
-  const x = state.dx
-  const y = state.dy
-  const r = x * ROTATE_FACTOR
-  const transition = state.dragging ? 'none' : 'transform 0.35s cubic-bezier(.22,.61,.36,1)'
-  return `transform: translate(${x}px, ${y}px) rotate(${r}deg); transition: ${transition};`
+  const rotation = reducedMotion.value
+    ? 0
+    : Math.max(-MAX_ROTATION, Math.min(MAX_ROTATION, dx.value * 0.06 * rotationSign))
+  let transition = 'none'
+  if (phase.value === 'exiting') {
+    transition = reducedMotion.value
+      ? `opacity ${EXIT_MS / 2}ms linear`
+      : `transform ${EXIT_MS}ms cubic-bezier(.4,0,1,1), opacity ${EXIT_MS}ms linear`
+  }
+  else if (phase.value === 'returning' || phase.value === 'holding') {
+    transition = reducedMotion.value ? 'none' : `transform ${RETURN_MS}ms cubic-bezier(.18,1.3,.4,1)`
+  }
+  else if (phase.value === 'idle') {
+    transition = reducedMotion.value ? 'opacity 120ms linear' : 'transform 200ms ease-out, opacity 200ms ease-out'
+  }
+  return {
+    transform: `translate3d(${dx.value}px, ${dy.value}px, 0) rotate(${rotation}deg) scale(${scale.value})`,
+    opacity: opacity.value,
+    transition,
+  }
 })
 
-let root: HTMLElement | null = null
+function wait(ms: number) {
+  if (timer) clearTimeout(timer)
+  return new Promise<void>((resolve) => {
+    timer = setTimeout(() => {
+      timer = null
+      resolve()
+    }, ms)
+  })
+}
 
 function onPointerDown(e: PointerEvent) {
-  if (state.animating) return
-  if (!card.value) return
-  root = card.value
-  root.setPointerCapture(e.pointerId)
-  state.dragging = true
-  state.startX = e.clientX - state.dx
-  state.startY = e.clientY - state.dy
-  window.addEventListener('pointermove', onPointerMove)
-  window.addEventListener('pointerup', onPointerUp)
+  if (props.disabled || pointerId !== null) return
+  if (phase.value !== 'idle' && phase.value !== 'returning') return
+  if (e.pointerType === 'mouse' && e.button !== 0) return
+  pointerId = e.pointerId
+  try {
+    card.value?.setPointerCapture(e.pointerId)
+  }
+  catch {
+    // Capture is best-effort (unsupported in some test DOMs).
+  }
+  phase.value = 'dragging'
+  forcedHint.value = null
+  startX = e.clientX - dx.value
+  startY = e.clientY - dy.value
+  const rect = card.value?.getBoundingClientRect()
+  // Grabbing the lower half tilts the other way, like holding a real card.
+  rotationSign = rect && rect.height > 0 && e.clientY > rect.top + rect.height / 2 ? -1 : 1
+  samples = [{ x: e.clientX, y: e.clientY, t: performance.now() }]
 }
 
 function onPointerMove(e: PointerEvent) {
-  if (!state.dragging || state.animating) return
-  state.dx = e.clientX - state.startX
-  state.dy = e.clientY - state.startY
+  if (phase.value !== 'dragging' || e.pointerId !== pointerId) return
+  dx.value = e.clientX - startX
+  dy.value = e.clientY - startY
+  const t = performance.now()
+  samples.push({ x: e.clientX, y: e.clientY, t })
+  samples = samples.filter(s => t - s.t <= 100)
 }
 
-function resetPosition() {
-  state.dragging = false
-  state.animating = false
-  state.animDir = null
-  state.dx = 0
-  state.dy = 0
+function releaseVelocity() {
+  const first = samples[0]
+  const last = samples[samples.length - 1]
+  if (!first || !last) return { vx: 0, vy: 0 }
+  const dt = last.t - first.t
+  if (dt < 16) return { vx: 0, vy: 0 }
+  return { vx: (last.x - first.x) / dt, vy: (last.y - first.y) / dt }
 }
 
-function onPointerUp() {
-  if (!state.dragging) return
-  const finalDx = state.dx
-  const finalDy = state.dy
-  state.dragging = false
-
-  // Vertical gestures
-  const verticalDominant = Math.abs(finalDy) > Math.abs(finalDx)
-  if (verticalDominant) {
-    if (finalDy < -THRESHOLD_Y) {
-      void flingUp()
-      cleanup()
-      return
-    }
-    if (finalDy > THRESHOLD_Y) {
-      // Open options menu (no fling)
-      resetPosition()
-      emit('options')
-      cleanup()
-      return
-    }
-  }
-
-  if (finalDx > THRESHOLD_X) {
-    void flingRight()
-    cleanup()
+function onPointerUp(e: PointerEvent) {
+  if (phase.value !== 'dragging' || e.pointerId !== pointerId) return
+  pointerId = null
+  const { vx, vy } = releaseVelocity()
+  const dir = resolveSwipe(dx.value, dy.value, vx, vy, threshold())
+  if (dir === 'down') {
+    void springBack()
+    emit('details')
     return
   }
-  if (finalDx < -THRESHOLD_X) {
-    void flingLeft()
-    cleanup()
+  if (dir) {
+    // Hold the card where it was dropped until the parent confirms or rejects.
+    phase.value = 'holding'
+    forcedHint.value = dir
+    emit('swipe', dir)
     return
   }
-
-  // snap back
-  resetPosition()
-  emit('cancel')
-  cleanup()
+  void springBack()
 }
 
-async function fling(dir: 'left' | 'right') {
-  if (state.animating) return
-  state.animating = true
-  state.animDir = dir
-  // give a subtle upward motion
-  state.dy = -30
-  state.dx = dir === 'right' ? window.innerWidth : -window.innerWidth
-  await new Promise(resolve => setTimeout(resolve, 300))
-  resetPosition()
-  if (dir === 'right') emit('like')
-  else emit('dislike')
+function onPointerCancel(e: PointerEvent) {
+  if (phase.value !== 'dragging' || e.pointerId !== pointerId) return
+  pointerId = null
+  void springBack()
 }
 
-async function flingUp() {
-  if (state.animating) return
-  state.animating = true
-  state.animDir = 'up'
-  state.dx = 0
-  state.dy = -window.innerHeight
-  await new Promise(resolve => setTimeout(resolve, 300))
-  resetPosition()
-  emit('superlike')
+/** Animates the card off-screen. Resolves when it has gone. */
+async function exit(dir: SwipeDir) {
+  pointerId = null
+  forcedHint.value = dir === 'down' ? null : dir
+  phase.value = 'exiting'
+  if (reducedMotion.value) {
+    opacity.value = 0
+    await wait(EXIT_MS / 2)
+    return
+  }
+  const w = typeof window === 'undefined' ? 1000 : window.innerWidth
+  const h = typeof window === 'undefined' ? 1000 : window.innerHeight
+  if (dir === 'left' || dir === 'right') {
+    const sign = dir === 'right' ? 1 : -1
+    dx.value = sign * (w + 200)
+    dy.value = dy.value + 40
+  }
+  else {
+    dy.value = dir === 'up' ? -(h + 200) : h + 200
+  }
+  opacity.value = 0.4
+  await wait(EXIT_MS)
 }
 
-async function flingRight() { await fling('right') }
-async function flingLeft() { await fling('left') }
-
-function cleanup() {
-  window.removeEventListener('pointermove', onPointerMove)
-  window.removeEventListener('pointerup', onPointerUp)
+/** Returns the card to the centre (e.g. after a failed action). */
+async function springBack() {
+  pointerId = null
+  forcedHint.value = null
+  phase.value = 'returning'
+  dx.value = 0
+  dy.value = 0
+  opacity.value = 1
+  scale.value = 1
+  await wait(reducedMotion.value ? 0 : RETURN_MS)
+  if (phase.value === 'returning') phase.value = 'idle'
 }
 
-onUnmounted(() => cleanup())
+/** Leans the card towards a direction while a button/keyboard action is pending. */
+function nudge(dir: 'left' | 'right' | 'up') {
+  if (phase.value === 'dragging' || phase.value === 'exiting') return
+  phase.value = 'holding'
+  forcedHint.value = dir
+  if (reducedMotion.value) return
+  dx.value = dir === 'left' ? -36 : dir === 'right' ? 36 : 0
+  dy.value = dir === 'up' ? -36 : 0
+}
 
-defineExpose({ flingRight, flingLeft, flingUp })
+function enter() {
+  if (timer) clearTimeout(timer)
+  pointerId = null
+  forcedHint.value = null
+  phase.value = 'entering'
+  dx.value = 0
+  dy.value = 0
+  opacity.value = 0
+  scale.value = reducedMotion.value ? 1 : 0.94
+  // Two frames so the reset is painted before transitioning back in.
+  requestAnimationFrame(() => requestAnimationFrame(() => {
+    if (phase.value !== 'entering') return
+    phase.value = 'idle'
+    opacity.value = 1
+    scale.value = 1
+  }))
+}
+
+watch(() => props.itemKey, (next, prev) => {
+  if (next !== prev) enter()
+})
+
+// iOS Safari: stop the page from scrolling / pull-to-refresh while dragging.
+function blockTouchMove(e: TouchEvent) {
+  if (phase.value === 'dragging' && e.cancelable) e.preventDefault()
+}
+
+function onMotionChange(e: MediaQueryListEvent) {
+  reducedMotion.value = e.matches
+}
+
+onMounted(() => {
+  card.value?.addEventListener('touchmove', blockTouchMove, { passive: false })
+  if (typeof window.matchMedia === 'function') {
+    motionQuery = window.matchMedia('(prefers-reduced-motion: reduce)')
+    reducedMotion.value = motionQuery.matches
+    motionQuery.addEventListener?.('change', onMotionChange)
+  }
+})
+
+onBeforeUnmount(() => {
+  card.value?.removeEventListener('touchmove', blockTouchMove)
+  motionQuery?.removeEventListener?.('change', onMotionChange)
+  if (timer) clearTimeout(timer)
+})
+
+defineExpose({ exit, springBack, nudge })
 </script>
 
 <style scoped>
 .swipe-card {
   position: relative;
-  width: 100%;
-  height: 100%;
-  touch-action: none; /* allow custom gestures */
+  touch-action: none;
+  user-select: none;
+  -webkit-user-select: none;
+  -webkit-touch-callout: none;
   will-change: transform;
+  cursor: grab;
 }
-.swipe-card.liking {
-  box-shadow: 0 10px 30px rgba(16,185,129,0.35);
+.swipe-card.phase-dragging {
+  cursor: grabbing;
 }
-.swipe-card.disliking {
-  box-shadow: 0 10px 30px rgba(239,68,68,0.35);
-}
-.swipe-card.superliking {
-  box-shadow: 0 10px 30px rgba(59,130,246,0.35); /* blue-500 */
-}
-/* Bigger, bolder, more visible LIKE/NOPE/SUPERLIKE stamps */
-.badge {
+.tint {
   position: absolute;
-  top: 50%;
-  padding: 10px 16px;
+  inset: 0;
+  pointer-events: none;
+  z-index: 4;
+}
+.tint-left { background: #ef4444; }
+.tint-right { background: #10b981; }
+.tint-up { background: #f5b301; }
+.tint-down { background: #64748b; }
+
+/* Bold rubber stamps, kept from the original design. */
+.stamp {
+  position: absolute;
+  top: 12%;
+  padding: 8px 14px;
   border-radius: 10px;
   font-weight: 800;
-  font-size: clamp(20px, 6vw, 42px);
+  font-size: clamp(22px, 6vw, 42px);
   letter-spacing: 2px;
-  text-transform: uppercase;
-  background: transparent;
-  color: white;
-  border: 4px solid rgba(255,255,255,0.9);
-  text-shadow: 0 2px 8px rgba(0,0,0,0.45);
-  backdrop-filter: blur(2px);
+  border: 4px solid currentColor;
+  text-shadow: 0 2px 8px rgba(0, 0, 0, 0.45);
+  background: rgba(0, 0, 0, 0.12);
+  pointer-events: none;
   z-index: 5;
-  --rot: 0deg;
-  transform: translateY(-50%) rotate(var(--rot)) scale(0.9);
-  opacity: 0.95;
 }
-.badge.like {
+/* Each stamp sits on the side that stays on screen while dragging. */
+.stamp-right {
   left: 16px;
-  color: #10B981; /* emerald-500 */
-  border-color: rgba(16,185,129,0.95);
-  box-shadow: 0 0 0 4px rgba(16,185,129,0.18), 0 6px 22px rgba(16,185,129,0.25);
-  --rot: -12deg;
+  color: #10b981;
+  transform: rotate(-12deg);
 }
-.badge.dislike {
+.stamp-left {
   right: 16px;
-  color: #EF4444; /* red-500 */
-  border-color: rgba(239,68,68,0.95);
-  box-shadow: 0 0 0 4px rgba(239,68,68,0.18), 0 6px 22px rgba(239,68,68,0.25);
-  --rot: 12deg;
+  color: #ef4444;
+  transform: rotate(12deg);
 }
-.badge.superlike {
+.stamp-up {
+  top: auto;
+  bottom: 18%;
   left: 50%;
-  transform: translate(-50%, -50%) rotate(0deg) scale(0.9);
-  color: #3B82F6; /* blue-500 */
-  border-color: rgba(59,130,246,0.95);
-  box-shadow: 0 0 0 4px rgba(59,130,246,0.18), 0 6px 22px rgba(59,130,246,0.25);
+  color: #f5b301;
+  transform: translateX(-50%);
 }
-.badge.pop {
-  animation: pop 250ms ease-out both;
-}
-@keyframes pop {
-  0% { transform: scale(0.75); opacity: 0; }
-  60% { transform: scale(1.1); opacity: 1; }
-  100% { transform: scale(1); opacity: 1; }
+.stamp-down {
+  left: 50%;
+  color: #e2e8f0;
+  font-size: clamp(16px, 4vw, 24px);
+  transform: translateX(-50%);
 }
 </style>

@@ -1,0 +1,152 @@
+# ImmichTinder + Tailscale sidecar: a self-contained Dockge stack.
+#
+# Paste this file as the stack's compose.yaml in Dockge (use it INSTEAD of
+# docker-compose.yml, not as an override; Dockge manages one file per stack).
+#
+# Topology: the app shares the tailscale container's network namespace
+# (`network_mode: service:tailscale`).
+#   - `tailscale serve` terminates HTTPS on https://<TS_HOSTNAME>.<tailnet>.ts.net
+#     (port 443) and proxies to http://127.0.0.1:3000 inside that namespace.
+#   - The app listens on 127.0.0.1 only (HOST below), so it is not reachable
+#     from the LAN or from other containers, only through Tailscale.
+#   - The sidecar joins the Immich network, which gives the shared namespace
+#     (and therefore the app) access to the Immich server by container name.
+#   - No ports are published on the host.
+#   - Funnel is OFF: serve.json sets AllowFunnel to false and no funnel
+#     command is ever run. Never enable Funnel for this app.
+#
+# Variables in ${...} come from the `.env` file next to this file.
+# Required: IMMICH_NETWORK, DATA_PATH, TS_STATE_PATH, TS_AUTHKEY (first start).
+
+name: immich-tinder
+
+services:
+  tailscale:
+    image: tailscale/tailscale:v1.104
+    container_name: immich-tinder-tailscale
+    hostname: ${TS_HOSTNAME:-immich-tinder}
+    restart: unless-stopped
+    environment:
+      # One-off, pre-approved, tagged auth key. Only needed until the node has
+      # logged in once (state is persisted in TS_STATE_DIR); you can then
+      # remove it from .env.
+      TS_AUTHKEY: ${TS_AUTHKEY:-}
+      TS_HOSTNAME: ${TS_HOSTNAME:-immich-tinder}
+      TS_EXTRA_ARGS: --advertise-tags=${TS_TAG:-tag:immich-tinder}
+      TS_STATE_DIR: /var/lib/tailscale
+      TS_SERVE_CONFIG: /config/serve.json
+      # Userspace networking: no /dev/net/tun or NET_ADMIN needed. Serve
+      # proxies to 127.0.0.1 inside this namespace, so that is all we need.
+      TS_USERSPACE: "true"
+      TS_AUTH_ONCE: "true"
+      # Leave the container's DNS alone so Docker's resolver (immich_server
+      # etc.) keeps working for the app.
+      TS_ACCEPT_DNS: "false"
+      TS_SOCKET: /tmp/tailscaled.sock
+    configs:
+      - source: tailscale-serve
+        target: /config/serve.json
+    volumes:
+      - ${TS_STATE_PATH:?set TS_STATE_PATH in .env}:/var/lib/tailscale
+      # Alternative to the inline config: remove `configs:` above and mount
+      # the repo's deploy/tailscale/ directory (copied next to this file):
+      # - ./deploy/tailscale:/config:ro
+    networks:
+      - default
+      - immich
+    security_opt:
+      - no-new-privileges:true
+    mem_limit: 256m
+    memswap_limit: 256m
+    healthcheck:
+      # Healthy once tailscaled reports it is connected to the tailnet.
+      test: ["CMD", "tailscale", "--socket=/tmp/tailscaled.sock", "status", "--peers=false"]
+      interval: 30s
+      timeout: 10s
+      start_period: 30s
+      retries: 3
+
+  immich-tinder:
+    # Option A (default): prebuilt multi-arch image from GHCR.
+    image: ghcr.io/olliepotter/immichtinder:latest
+    # Option B: build from the GitHub repo instead:
+    # build:
+    #   context: https://github.com/olliepotter/ImmichTinder.git#main
+    #   args:
+    #     APP_UID: "568"
+    #     APP_GID: "568"
+    container_name: immich-tinder
+    restart: unless-stopped
+    network_mode: service:tailscale
+    depends_on:
+      tailscale:
+        condition: service_started
+    environment:
+      # Only the app's own variables are passed in (not the whole .env), so the
+      # Tailscale auth key and other stack variables never reach the app.
+      NUXT_IMMICH_URL: ${NUXT_IMMICH_URL:?set NUXT_IMMICH_URL in .env}
+      NUXT_IMMICH_API_KEY: ${NUXT_IMMICH_API_KEY:?set NUXT_IMMICH_API_KEY in .env}
+      NUXT_APP_PASSWORD: ${NUXT_APP_PASSWORD:?set NUXT_APP_PASSWORD in .env}
+      NUXT_SESSION_PASSWORD: ${NUXT_SESSION_PASSWORD:?set NUXT_SESSION_PASSWORD in .env}
+      NUXT_PUBLIC_IMMICH_WEB_URL: ${NUXT_PUBLIC_IMMICH_WEB_URL:-}
+      NUXT_DATABASE_PATH: /data/immich-tinder.db
+      # Loopback only: reachable solely via the Tailscale serve proxy.
+      HOST: 127.0.0.1
+      PORT: "3000"
+      # Served over HTTPS by Tailscale, so secure cookies stay on.
+      NUXT_COOKIE_SECURE: "true"
+    user: "${APP_UID:-568}:${APP_GID:-568}"
+    volumes:
+      - ${DATA_PATH:?set DATA_PATH in .env}:/data
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 256
+    mem_limit: 512m
+    memswap_limit: 512m
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - "fetch('http://127.0.0.1:3000/api/health',{signal:AbortSignal.timeout(4000)}).then(r=>process.exit(r.ok?0:1),()=>process.exit(1))"
+      interval: 30s
+      timeout: 5s
+      start_period: 20s
+      retries: 3
+
+networks:
+  default:
+    name: immich-tinder_default
+  immich:
+    # The existing network your Immich server is attached to. Find it with
+    #   docker network ls
+    #   docker inspect immich_server --format '{{json .NetworkSettings.Networks}}'
+    name: ${IMMICH_NETWORK:?set IMMICH_NETWORK in .env}
+    external: true
+
+configs:
+  # Same content as deploy/tailscale/serve.json. `$$` escapes Compose
+  # interpolation so tailscale's containerboot sees ${TS_CERT_DOMAIN} and fills
+  # in this node's MagicDNS name. Inline configs need Docker Compose >= 2.23.1.
+  tailscale-serve:
+    content: |
+      {
+        "TCP": {
+          "443": { "HTTPS": true }
+        },
+        "Web": {
+          "$${TS_CERT_DOMAIN}:443": {
+            "Handlers": {
+              "/": { "Proxy": "http://127.0.0.1:3000" }
+            }
+          }
+        },
+        "AllowFunnel": {
+          "$${TS_CERT_DOMAIN}:443": false
+        }
+      }

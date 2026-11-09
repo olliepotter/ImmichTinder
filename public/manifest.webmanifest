@@ -1,0 +1,14 @@
+{
+  "name": "Immich Tinder",
+  "short_name": "Immich Tinder",
+  "description": "Swipe through your Immich library to keep, favourite or trash photos.",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "orientation": "any",
+  "background_color": "#0b0d10",
+  "theme_color": "#0b0d10",
+  "icons": [
+    { "src": "/favicon.png", "sizes": "1024x1024", "type": "image/png", "purpose": "any" }
+  ]
+}

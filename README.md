@@ -1,159 +1,120 @@
-
 <p align="center">
   <img src="public/logo.png" alt="Immich Tinder" width="180" />
 </p>
 
-A tiny Nuxt 4 app that lets you swipe through random photos from your own Immich server — like Tinder, but for your photo library. It fetches random assets from Immich, displays the image with basic EXIF info (date and location when available), and supports like, superlike, and delete actions via server routes.
+# ImmichTinder
 
-> ⚠️ Security notice: This app has no built-in authentication. All server endpoints are unauthenticated. You must protect it with your own authentication layer (e.g., reverse proxy with Basic Auth or OAuth/OIDC, IP allow-listing, or a VPN). Do not expose it directly to the public internet.
+A self-hosted, Tinder-style photo clean-up app for [Immich](https://immich.app).
+Swipe through your library (or one album, or a date range) one photo at a
+time: **keep** it, **favourite** it, or move it to **Immich's trash**. Your
+progress is remembered, so reviewed photos never come back.
 
-<p align="center">
-  <img src="demo.png" alt="Demo" width="400" />
-</p>
+Built with Nuxt 4 (Nitro server) and SQLite. Designed to run on a home server
+next to Immich and be reached privately over [Tailscale](https://tailscale.com).
 
-- Framework: Nuxt 4 (Nitro server)
-- Runtime: Node.js 22+
-- Server routes live under `server/api/*` and proxy Immich with your API key so it never reaches the browser directly.
+This is a fork of [MaaxGr/ImmichTinder](https://github.com/MaaxGr/ImmichTinder),
+reworked for safe, single-user library clean-up.
 
-## Prerequisites
+## Safety model
 
-- Node.js >= 22.12.0
-- An Immich instance you can access (URL) and an API key
-- npm (or another compatible package manager)
+- **Never permanent delete.** "Trash" calls Immich with `force: false`, which
+  moves the photo to Immich's trash. Nothing in the app can empty the trash or
+  force-delete. Photos stay recoverable for Immich's trash retention period.
+  **Make sure trash is enabled in Immich** (Administration > Settings > Trash
+  Settings); without it, Immich deletes immediately.
+- **Undo** reverts the last decision in Immich (restores from trash, or resets
+  the favourite flag) and walks further back on repeated presses.
+- **Failed Immich calls change nothing.** History is only written after Immich
+  confirms.
+- **The Immich API key stays on the server.** Images are proxied; the browser
+  never sees the key. Use a key restricted to the permissions below.
+- **Private by design.** Password login, and the deployment publishes no
+  public ports: it is reached only through your tailnet (Tailscale Funnel
+  stays off).
 
-## Environment variables
+Start with a test album of disposable images before reviewing your real library.
 
-Create a `.env` file at the project root with the following variables:
+## Controls
 
-```
-IMMICH_URL=https://your-immich.example.com
-IMMICH_TOKEN=your_immich_api_key
-IMMICH_ALBUM_ID=<album_id_for_likes_and_superlikes>
-```
+| Gesture | Key | Action |
+|---|---|---|
+| Swipe left | `←` / `D` | Trash (recoverable) |
+| Swipe right | `→` / `K` | Keep |
+| Swipe up | `↑` / `F` | Favourite |
+| Swipe down | `↓` / `I` | Details (metadata, Skip, Open in Immich) |
+| Skip button | `S` | Skip for this session (not recorded) |
+| Undo button | `U` / `Ctrl+Z` / `⌘Z` | Undo the last decision |
 
-Notes:
-- IMMICH_URL is your Immich base URL (no trailing slash). It is also exposed to the client for deep-linking to Immich Web.
-- IMMICH_TOKEN is used as the `x-api-key` when the server calls Immich.
-- IMMICH_ALBUM_ID is the Immich album to which liked and superliked assets will be added.
+The card only flies away once the server confirms; on failure it springs back
+and shows an error. A stats bar shows kept / trashed / favourited / remaining
+and overall progress. The scope picker selects the whole library or an album,
+the order (random, oldest, newest) and an optional date range.
 
-## Install
+## Quick start (development)
+
+Requires Node.js >= 22.12 and an Immich server with an API key.
 
 ```bash
 npm ci
+cp .env.example .env    # then fill in the values (see below)
+npm run dev             # http://localhost:3000
 ```
 
-If you prefer another package manager, adjust accordingly (the project includes npm scripts).
+For plain-HTTP local testing outside `npm run dev`, set
+`NUXT_COOKIE_SECURE=false`, otherwise the session cookie is not stored.
 
-## Run in development
+Other scripts: `npm run build` (Nitro output in `.output/`), `npm run preview`,
+`npm run lint`, `npm run typecheck`, `npm test`.
+
+## Configuration
+
+All configuration is via environment variables (a `.env` file in development).
+Full details in [docs/DESIGN.md](docs/DESIGN.md#configuration-server-side-env-read-via-useruntimeconfig).
+
+| Variable | Required | Description |
+|---|---|---|
+| `NUXT_IMMICH_URL` | yes | Immich base URL, no trailing slash, e.g. `http://immich_server:2283` |
+| `NUXT_IMMICH_API_KEY` | yes | Immich API key (see permissions below) |
+| `NUXT_APP_PASSWORD` | yes in production | Login password |
+| `NUXT_SESSION_PASSWORD` | yes in production | At least 32 characters; seals the session cookie. Generate with `openssl rand -base64 48` |
+| `NUXT_DATABASE_PATH` | no | SQLite file. Default `./data/immich-tinder.db`; `/data/immich-tinder.db` in Docker |
+| `NUXT_PUBLIC_IMMICH_WEB_URL` | no | Immich web URL for "Open in Immich" links (not a secret) |
+| `NUXT_COOKIE_SECURE` | no | Default `true` in production; `false` only for plain-HTTP testing |
+
+Legacy names are still accepted as fallbacks: `IMMICH_URL`, `IMMICH_API_KEY`
+(or `IMMICH_TOKEN`), `APP_PASSWORD`, `SESSION_SECRET`, `DATABASE_PATH`.
+
+**Immich API key permissions** (grant only these): `asset.read`,
+`asset.view`, `asset.update`, `asset.delete`, `asset.statistics`,
+`album.read`, `user.read`.
+
+## Deployment
+
+The production image is multi-arch (amd64, arm64), runs as a non-root user
+(UID/GID 568 by default) with a read-only root filesystem, stores its database
+in `/data`, and exposes a health check at `GET /api/health`.
 
 ```bash
-npm run dev
+docker pull ghcr.io/olliepotter/immichtinder:latest
 ```
 
-Then open http://localhost:3000.
+- [docs/deployment.md](docs/deployment.md): step-by-step for TrueNAS SCALE +
+  Dockge, joining the Immich Docker network, and private HTTPS through a
+  Tailscale sidecar (`docker-compose.tailscale.yml`) or the host's Tailscale
+  (`docker-compose.yml`).
+- [docs/backup.md](docs/backup.md): ZFS snapshots, nightly SQLite backups and
+  restore.
+- [docs/DESIGN.md](docs/DESIGN.md): API contract, data model and Immich calls.
 
-## Usage and gestures
+Do not expose the app to the public internet.
 
-- Swipe right: Like (adds to IMMICH_ALBUM_ID)
-- Swipe left: Dislike (no-op server route for now)
-- Swipe up: Superlike (marks as favorite in Immich and adds to IMMICH_ALBUM_ID)
-- Swipe down: Options menu (shows the asset ID and actions)
-  - Open in Immich (opens Immich Web for the asset)
-  - Delete image (deletes the asset from Immich)
+## Credits
 
-A refresh button in the header loads the next card. Bottom controls were removed; gestures drive the experience.
+Original app by [MaaxGr](https://github.com/MaaxGr):
+[MaaxGr/ImmichTinder](https://github.com/MaaxGr/ImmichTinder). Thanks also to
+the [Immich](https://github.com/immich-app/immich) project.
 
-## Build for production
+## Licence
 
-```bash
-npm run build
-```
-
-Preview the production build locally:
-
-```bash
-npm run preview
-```
-
-## Docker
-
-A multi‑stage Dockerfile is provided.
-
-Build the image:
-
-```bash
-docker build -t immich-tinder .
-```
-
-Run the container (exposes port 3000):
-
-```bash
-docker run --rm -p 3000:3000 \
-  -e IMMICH_URL=https://your-immich.example.com \
-  -e IMMICH_TOKEN=your_immich_api_key \
-  -e IMMICH_ALBUM_ID=your_album_id \
-  immich-tinder
-```
-
-## API routes (server)
-
-These routes are implemented under `server/api` and run only on the server side.
-
-- GET `/api/random`
-  - Returns a random Immich asset with a normalized payload:
-    - `id`, `localDateTime`, `takenAt`, and `location` (with `text`, `city`, `state`, `country`, `latitude`, `longitude` when available).
-
-- GET `/api/image?id=ASSET_ID`
-  - Streams the preview thumbnail bytes for the given asset ID (Immich `size=preview`).
-  - Response headers include `Content-Type: image/jpeg` and an inline `Content-Disposition`.
-
-- POST `/api/like`
-  - Adds the asset to your configured Immich album (see `IMMICH_ALBUM_ID`).
-  - Body: `{ "id": "ASSET_ID" }`
-
-- POST `/api/dislike`
-  - Currently a no-op placeholder that just validates the payload and returns `{ success: true }`.
-  - Body: `{ "id": "ASSET_ID" }`
-
-- POST `/api/superlike`
-  - Marks the asset as favorite in Immich and adds it to `IMMICH_ALBUM_ID`.
-  - Body: `{ "id": "ASSET_ID" }`
-
-- POST `/api/delete`
-  - Deletes the asset from Immich. Tries single-asset delete first and falls back to bulk delete if needed.
-  - Body: `{ "id": "ASSET_ID" }`
-
-## How it works (high level)
-
-- The client requests a random asset via `/api/random`.
-- When an image needs to be displayed, the client requests `/api/image?id=...` which the server proxies to Immich and returns the binary data.
-- Likes and superlikes are posted to server routes that update Immich (album add, and favorite for superlike). Dislike is currently a no-op. Deletion is performed via `/api/delete`.
-
-## Troubleshooting
-
-- 400 Missing id in request body: Ensure you send `{ id: "..." }` to `/api/like`, `/api/dislike`, `/api/superlike`, or `/api/delete`.
-- 400 Missing ?id parameter: Provide `?id=...` when calling `/api/image`.
-- 404 Image not found (from `/api/image`): The asset might be missing or the ID is wrong.
-- 500 Server misconfigured: IMMICH_ALBUM_ID is missing (for like/superlike). Set it in environment variables.
-- 5xx from Immich: Verify `IMMICH_URL` and `IMMICH_TOKEN`, and that your Immich server is reachable from the app/container.
-
-## Scripts
-
-- `npm run dev` — Start the dev server
-- `npm run build` — Build for production (Nitro output in `.output`)
-- `npm run preview` — Preview the production build locally
-
-## Security
-
-- Bring your own authentication. This app’s server endpoints do not include any authentication or authorization. If you expose it beyond your trusted network, you must protect it yourself (e.g., via a reverse proxy with Basic Auth, OAuth/OIDC, IP allow‑listing, or a VPN). Examples: Nginx/Traefik/Caddy with Basic Auth, oauth2-proxy, Cloudflare Access, Tailscale/Gateway, etc.
-- Your Immich API key is used only on the server (Nitro) side. Do not expose it in client code.
-- In Docker, pass the env vars at runtime (see command above). Avoid baking secrets into images.
-- Recommendation: run this behind an auth‑enabled reverse proxy and do not expose it directly to the public internet unless you fully understand the risks.
-
-## Project structure (selected)
-
-- `app/` — Vue components and pages
-- `server/api/` — Nitro routes that talk to Immich
-- `public/` — Static assets
-- `nuxt.config.ts` — Nuxt configuration
-- `Dockerfile` — Multi‑stage build for production
+The upstream repository does not include a licence file, and this fork does
+not add one.
